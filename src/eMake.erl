@@ -8,75 +8,79 @@
 -include_lib("kernel/include/file.hrl").
 
 -export([
-   all/1,
-   all/2,
-   files/2,
-   files/3
+   main/1
+   , all/3
 ]).
 
 -define(MakeOpts, [noexec, load, netload, noload]).
 
-all(Worker) when is_integer(Worker) ->
-   all(Worker, []).
+main(Args) ->
+   io:format("~p~n", [Args]),
 
-all(Worker, Options) when is_integer(Worker) ->
-   {MakeOpts, CompileOpts} = sort_options(Options, [], []),
-   case read_emakefile('Emakefile', CompileOpts) of
+   case Args of
+      [] ->
+         all(max(1, erlang:system_info(schedulers) - 1), "./Emakefile", []);
+      [EMakeFileOrCnt] ->
+         try list_to_integer(EMakeFileOrCnt) of
+            Cnt ->
+               all(max(1, Cnt), "./Emakefile", [])
+         catch _:_ ->
+            all(max(1, erlang:system_info(schedulers) - 1), EMakeFileOrCnt, [])
+         end;
+      [EMakeFile, CntStr] ->
+         all(max(1, list_to_integer(CntStr)), EMakeFile, []);
+      [EMakeFile, CntStr, OptsStr] ->
+         {ok, Opts} = strToTerm(OptsStr),
+         all(max(1, list_to_integer(CntStr)), EMakeFile, Opts)
+   end.
+
+all(Worker, EMakeFile, Opts) ->
+   {MakeOpts, CompileOpts} = splitOpts(Opts, [], []),
+   case readEMakefile(EMakeFile, CompileOpts) of
       Files when is_list(Files) ->
          do_make_files(Worker, Files, MakeOpts);
       error ->
          error
    end.
 
-files(Worker, Fs) ->
-   files(Worker, Fs, []).
+splitOpts([], Make, Compile) ->
+   {Make, lists:reverse(Compile)};
+splitOpts([H | T], Make, Compile) ->
+   case lists:member(H, ?MakeOpts) of
+      true ->
+         splitOpts(T, [H | Make], Compile);
+      false ->
+         splitOpts(T, Make, [H | Compile])
+   end.
 
-files(Worker, Fs0, Options) ->
-   Fs = [filename:rootname(F, ".erl") || F <- Fs0],
-   {MakeOpts, CompileOpts} = sort_options(Options, [], []),
-   case get_opts_from_emakefile(Fs, 'Emakefile', CompileOpts) of
-      Files when is_list(Files) ->
-         do_make_files(Worker, Files, MakeOpts);
-      error -> error
+
+%% term反序列化, string转换为term
+strToTerm(String) ->
+   case erl_scan:string(String ++ ".") of
+      {ok, Tokens, _} ->
+         erl_parse:parse_term(Tokens);
+      _Err ->
+         {error, _Err}
    end.
 
 do_make_files(Worker, Fs, Opts) ->
    %io:format("worker:~p~nfs:~p~nopts:~p~n", [Worker, Fs, Opts]),
    process(Fs, Worker, lists:member(noexec, Opts), load_opt(Opts)).
 
-sort_options([H | T], Make, Comp) ->
-   case lists:member(H, ?MakeOpts) of
-      true ->
-         sort_options(T, [H | Make], Comp);
-      false ->
-         sort_options(T, Make, [H | Comp])
-   end;
-sort_options([], Make, Comp) ->
-   {Make, lists:reverse(Comp)}.
 
-%%% Reads the given Emakefile and returns a list of tuples: {Mods,Opts}
-%%% Mods is a list of module names (strings)
-%%% Opts is a list of options to be used when compiling Mods
-%%%
-%%% Emakefile can contain elements like this:
-%%% Mod.
-%%% {Mod,Opts}.
-%%% Mod is a module name which might include '*' as wildcard
-%%% or a list of such module names
-%%%
-%%% These elements are converted to [{ModList,OptList},...]
-%%% ModList is a list of modulenames (strings)
-read_emakefile(Emakefile, Opts) ->
-   case file:consult(Emakefile) of
-      {ok, Emake} ->
-         transform(Emake, Opts, [], []);
+%%% 读取给定的 Emakefile 并返回一个元组列表： [{Mods,Opts}]
+%%% %%% Mods 是模块名称（字符串）的列表
+%%% %%% Opts 是编译 Mods 时要使用的选项列表
+readEMakefile(EMakefile, Opts) ->
+   case file:consult(EMakefile) of
+      {ok, EMake} ->
+         transform(EMake, Opts, [], []);
       {error, enoent} ->
-         %% No Emakefile found - return all modules in current
-         %% directory and the options given at command line
+         %% 没有EMakefile 仅仅编译当前没有了下的文件 如果想要编译所有子目录下的文件 使用 filelib:wildcard("./**/*.erl")
          Mods = [filename:rootname(F) || F <- filelib:wildcard("*.erl")],
          [{Mods, Opts}];
       {error, Other} ->
-         io:format("make: Trouble reading 'Emakefile':~n~p~n", [Other]),
+         io:format("the Emakefile:~s is error:~p~n", [EMakefile, Other]),
          error
    end.
 
@@ -120,44 +124,6 @@ expand(Mod, Already) ->
          end
    end.
 
-%%% Reads the given Emakefile to see if there are any specific compile
-%%% options given for the modules.
-get_opts_from_emakefile(Mods, Emakefile, Opts) ->
-   case file:consult(Emakefile) of
-      {ok, Emake} ->
-         Modsandopts = transform(Emake, Opts, [], []),
-         ModStrings = [coerce_2_list(M) || M <- Mods],
-         get_opts_from_emakefile2(Modsandopts, ModStrings, Opts, []);
-      {error, enoent} ->
-         [{Mods, Opts}];
-      {error, Other} ->
-         io:format("make: Trouble reading 'Emakefile':~n~p~n", [Other]),
-         error
-   end.
-
-get_opts_from_emakefile2([{MakefileMods, O} | Rest], Mods, Opts, Result) ->
-   case members(Mods, MakefileMods, [], Mods) of
-      {[], _} ->
-         get_opts_from_emakefile2(Rest, Mods, Opts, Result);
-      {I, RestOfMods} ->
-         get_opts_from_emakefile2(Rest, RestOfMods, Opts, [{I, O} | Result])
-   end;
-get_opts_from_emakefile2([], [], _Opts, Result) ->
-   Result;
-get_opts_from_emakefile2([], RestOfMods, Opts, Result) ->
-   [{RestOfMods, Opts} | Result].
-
-members([H | T], MakefileMods, I, Rest) ->
-   case lists:member(H, MakefileMods) of
-      true ->
-         members(T, MakefileMods, [H | I], lists:delete(H, Rest));
-      false ->
-         members(T, MakefileMods, I, Rest)
-   end;
-members([], _MakefileMods, I, Rest) ->
-   {I, Rest}.
-
-
 %% Any flags that are not recognixed as make flags are passed directly
 %% to the compiler.
 %% So for example make:all([load,debug_info]) will make everything
@@ -189,34 +155,6 @@ process([{L, Opts} | Rest], Worker, NoExec, Load) ->
    end;
 process([], _Worker, _NoExec, _Load) ->
    up_to_date.
-
-%% worker进行编译
-%do_worker(L, Opts, NoExec, Load, Worker) ->
-%    WorkerList = do_split_list(L, Worker),
-%    io:format("worker:~p worker list(~p)~n,WorkerList:~p~n", [Worker, length(WorkerList)]),
-%    % 启动进程
-%    Ref = make_ref(),
-%    Pids =
-%    [begin
-%        start_worker(E, Opts, NoExec, Load, self(), Ref)
-%    end || E <- WorkerList],
-%    do_wait_worker(length(Pids), Ref).
-%
-%%% 等待结果
-%do_wait_worker(0, _Ref) ->
-%    ok;
-%do_wait_worker(N, Ref) ->
-%    receive
-%        {ack, Ref} ->
-%            do_wait_worker(N - 1, Ref);
-%        {error, Ref} ->
-%            throw(error);
-%        {'EXIT', _P, _Reason} ->
-%            do_wait_worker(N, Ref);
-%        _Other ->
-%            io:format("receive unknown msg:~p~n", [_Other]),
-%            do_wait_worker(N, Ref)
-%    end.
 
 do_worker(L, Opts, NoExec, Load, Worker) ->
 
@@ -256,36 +194,6 @@ do_wait_worker(N, L, Opts, NoExec, Load, Ref) ->
          do_wait_worker(N, L, Opts, NoExec, Load, Ref)
    end.
 
-%% 将L分割成最多包含N个子列表的列表
-%do_split_list(L, N) ->
-%    Len = length(L),
-%    % 每个列表的元素数
-%    LLen = (Len + N - 1) div N,
-%    do_split_list(L, LLen, []).
-%
-%do_split_list([], _N, Acc) ->
-%    lists:reverse(Acc);
-%do_split_list(L, N, Acc) ->
-%    {L2, L3} = lists:split(erlang:min(length(L), N), L),
-%    do_split_list(L3, N, [L2 | Acc]).
-%
-%%% 启动worker进程
-%start_worker(L, Opts, NoExec, Load, Parent, Ref) ->
-%    Fun =
-%    fun() ->
-%        [begin
-%            case recompilep(coerce_2_list(F), NoExec, Load, Opts) of
-%                error ->
-%                    Parent ! {error, Ref},
-%                    exit(error);
-%                _ ->
-%                    ok
-%            end
-%        end || F <- L],
-%        Parent ! {ack, Ref}
-%    end,
-%    spawn_link(Fun).
-%% 启动worker进程
 start_worker(F, Opts, NoExec, Load, Parent, Ref) ->
    Fun =
       fun() ->
@@ -301,8 +209,7 @@ start_worker(F, Opts, NoExec, Load, Parent, Ref) ->
    spawn_link(Fun).
 
 recompilep(File, NoExec, Load, Opts) ->
-   ObjName = lists:append(filename:basename(File),
-      code:objfile_extension()),
+   ObjName = lists:append(filename:basename(File), code:objfile_extension()),
    ObjFile = case lists:keysearch(outdir, 1, Opts) of
                 {value, {outdir, OutDir}} ->
                    filename:join(coerce_2_list(OutDir), ObjName);
