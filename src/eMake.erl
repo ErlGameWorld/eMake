@@ -67,14 +67,15 @@ do_make_files(Worker, Fs, Opts) ->
    %io:format("worker:~p~nfs:~p~nopts:~p~n", [Worker, Fs, Opts]),
    process(Fs, Worker, lists:member(noexec, Opts), load_opt(Opts)).
 
-
 %%% 读取给定的 Emakefile 并返回一个元组列表： [{Mods,Opts}]
 %%% %%% Mods 是模块名称（字符串）的列表
 %%% %%% Opts 是编译 Mods 时要使用的选项列表
 readEMakefile(EMakefile, Opts) ->
    case file:consult(EMakefile) of
       {ok, EMake} ->
-         transform(EMake, Opts, [], []);
+         Ret  = transform(EMake, Opts, []),
+         erase(),
+         Ret;
       {error, enoent} ->
          %% 没有EMakefile 仅仅编译当前没有了下的文件 如果想要编译所有子目录下的文件 使用 filelib:wildcard("./**/*.erl")
          Mods = [filename:rootname(F) || F <- filelib:wildcard("*.erl")],
@@ -84,43 +85,49 @@ readEMakefile(EMakefile, Opts) ->
          error
    end.
 
-transform([{Mod, ModOpts} | Emake], Opts, Files, Already) ->
-   case expand(Mod, Already) of
+transform([], _Opts, Files) ->
+   lists:reverse(Files);
+transform([{Mod, ModOpts} | EMake], Opts, Files) ->
+   case expand(Mod) of
       [] ->
-         transform(Emake, Opts, Files, Already);
+         transform(EMake, Opts, Files);
       Mods ->
-         transform(Emake, Opts, [{Mods, ModOpts ++ Opts} | Files], Mods ++ Already)
+         transform(EMake, Opts, [{Mods, ModOpts ++ Opts} | Files])
    end;
-transform([Mod | Emake], Opts, Files, Already) ->
-   case expand(Mod, Already) of
+transform([Mod | EMake], Opts, Files) ->
+   case expand(Mod) of
       [] ->
-         transform(Emake, Opts, Files, Already);
+         transform(EMake, Opts, Files);
       Mods ->
-         transform(Emake, Opts, [{Mods, Opts} | Files], Mods ++ Already)
-   end;
-transform([], _Opts, Files, _Already) ->
-   lists:reverse(Files).
+         transform(EMake, Opts, [{Mods, Opts} | Files])
+   end.
 
-expand(Mod, Already) when is_atom(Mod) ->
-   expand(atom_to_list(Mod), Already);
-expand(Mods, Already) when is_list(Mods), not is_integer(hd(Mods)) ->
-   lists:concat([expand(Mod, Already) || Mod <- Mods]);
-expand(Mod, Already) ->
+expand(Mod) when is_atom(Mod) ->
+   expand(atom_to_list(Mod));
+expand(Mods) when is_list(Mods), not is_integer(hd(Mods)) ->
+   lists:append([expand(Mod) || Mod <- Mods]);
+expand(Mod) ->
    case lists:member($*, Mod) of
       true ->
          Fun = fun(F, Acc) ->
             M = filename:rootname(F),
-            case lists:member(M, Already) of
-               true -> Acc;
-               false -> [M | Acc]
+            case get(M) of
+               undefined ->
+                  put(M, 1),
+                  [M | Acc];
+               _ ->
+                  Acc
             end
                end,
          lists:foldl(Fun, [], filelib:wildcard(Mod ++ ".erl"));
-      false ->
+      _ ->
          Mod2 = filename:rootname(Mod, ".erl"),
-         case lists:member(Mod2, Already) of
-            true -> [];
-            false -> [Mod2]
+         case get(Mod2) of
+            undefined ->
+               put(M, 1),
+               [Mod2];
+            _ ->
+               []
          end
    end.
 
