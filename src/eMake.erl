@@ -34,7 +34,10 @@ main(Args) ->
    end.
 
 eMakeFile() ->
-   filename:join(code:root_dir(), ".eMake.log").
+   {ok, CurDir} = file:get_cwd(),
+   Md5 = erlang:md5(CurDir),
+   Hex = [(io_lib:format("~2.36.0B", [X])) || <<X:8>> <= Md5],
+   filename:join(code:root_dir(), [".eMake/" | Hex]).
 
 readEMake() ->
    try {ok, [LastTime]} = file:consult(eMakeFile()), LastTime of
@@ -45,7 +48,10 @@ readEMake() ->
    end.
 
 saveEMake(NowTime) ->
-   try file:write_file(eMakeFile(), <<(integer_to_binary(NowTime))/binary, ".">>)
+   try
+      FileName = eMakeFile(),
+      filelib:ensure_dir(FileName),
+      file:write_file(FileName, <<(integer_to_binary(NowTime))/binary, ".">>)
    catch _:_ ->
       ok
    end.
@@ -57,15 +63,15 @@ all(WorkerCnt, EMakeFile, Opts) ->
       {ok, Files} ->
          forMake(Files, WorkerCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), []),
          EndTime = erlang:system_time(second),
-         % LastTime = readEMake(),
-         % case LastTime /= 0 andalso StartTime < LastTime of
-         %    true ->
-         %       %% StartTime < LastTime 当前系统时间比历史编译时间小的时候 可能往回调过时间 所以要全编译
-         %       put(compile_all, 1);
-         %    _ ->
-         %       ignore
-         % end,
-         % saveEMake(EndTime),
+         LastTime = readEMake(),
+         case LastTime /= 0 andalso StartTime < LastTime of
+            true ->
+               %% StartTime < LastTime 当前系统时间比历史编译时间小的时候 可能往回调过时间 所以要全编译
+               put(compile_all, 1);
+            _ ->
+               ignore
+         end,
+         saveEMake(EndTime),
          io:format("compile over all is ok use time:~ps", [EndTime - StartTime]);
       _Err ->
          _Err
@@ -132,15 +138,28 @@ transform([{Mod, ModOpts} | EMake], Opts, Files) ->
       [] ->
          transform(EMake, Opts, Files);
       Mods ->
-         transform(EMake, Opts, [{Mods, Opts ++ ModOpts} | Files])
+         NewOpts = Opts ++ ModOpts,
+         ensure_dir(NewOpts),
+         transform(EMake, Opts, [{Mods, NewOpts} | Files])
    end;
 transform([Mod | EMake], Opts, Files) ->
    case expand(Mod) of
       [] ->
          transform(EMake, Opts, Files);
       Mods ->
+         ensure_dir(Opts),
          transform(EMake, Opts, [{Mods, Opts} | Files])
    end.
+
+ensure_dir(Opts) ->
+   case lists:keysearch(outdir, 1, Opts) of
+      {value, {outdir, OutDir}} ->
+         BeamDir = filename:join(OutDir, "tttt.beam"),
+         filelib:ensure_dir(BeamDir);
+      _ ->
+         ignore
+   end.
+
 
 expand(Mod) when is_atom(Mod) ->
    expand(atom_to_list(Mod));
