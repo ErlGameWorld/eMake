@@ -6,7 +6,7 @@
 ]).
 
 -export([
-   compileWorker/5
+   compileWorker/6
    , readEMake/0
    , saveEMake/1
 ]).
@@ -15,7 +15,6 @@
 
 main(Args) ->
    process_flag(trap_exit, true),
-
    case Args of
       [] ->
          all(max(1, erlang:system_info(schedulers) - 1), "./Emakefile", []);
@@ -36,8 +35,7 @@ main(Args) ->
 eMakeFile() ->
    {ok, CurDir} = file:get_cwd(),
    Md5 = erlang:md5(CurDir),
-   Hex = [(io_lib:format("~2.36.0B", [X])) || <<X:8>> <= Md5],
-   filename:join(code:root_dir(), [".eMake/" | Hex]).
+   filename:join(code:root_dir(), <<".eMake/", (base64:encode(Md5))/binary>>).
 
 readEMake() ->
    try {ok, [LastTime]} = file:consult(eMakeFile()), LastTime of
@@ -57,22 +55,17 @@ saveEMake(NowTime) ->
    end.
 
 all(WorkerCnt, EMakeFile, Opts) ->
+   io:format("compile start use EMakefile: ~ts~n", [EMakeFile]),
    StartTime = erlang:system_time(second),
    {MakeOpts, CompileOpts} = splitOpts(Opts, [], []),
    case readEMakefile(EMakeFile, CompileOpts) of
       {ok, Files} ->
-         forMake(Files, WorkerCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), []),
-         EndTime = erlang:system_time(second),
          LastTime = readEMake(),
-         case LastTime /= 0 andalso StartTime < LastTime of
-            true ->
-               %% StartTime < LastTime 当前系统时间比历史编译时间小的时候 可能往回调过时间 所以要全编译
-               put(compile_all, 1);
-            _ ->
-               ignore
-         end,
+         IsAll = LastTime /= 0 andalso StartTime =< LastTime,
+         forMake(Files, WorkerCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), IsAll, []),
+         EndTime = erlang:system_time(second),
          saveEMake(EndTime),
-         io:format("compile over all is ok use time:~ps", [EndTime - StartTime]);
+         io:format("compile over all is ok use time: ~ps ~n", [EndTime - StartTime]);
       _Err ->
          _Err
    end.
@@ -154,7 +147,7 @@ transform([Mod | EMake], Opts, Files) ->
 ensure_dir(Opts) ->
    case lists:keysearch(outdir, 1, Opts) of
       {value, {outdir, OutDir}} ->
-         BeamDir = filename:join(OutDir, "tttt.beam"),
+         BeamDir = filename:join(OutDir, "xxx.beam"),
          filelib:ensure_dir(BeamDir);
       _ ->
          ignore
@@ -193,35 +186,40 @@ foldErl([OneFile | Left], Acc) ->
    end.
 
 -define(OnceCnt, 8).
-forMake([], _Worker, _NoExec, _Load, AllWorkPids) ->
-   receive
-      {mOverCompile, WPid} ->
-         NewAllWorkPids = lists:delete(WPid, AllWorkPids),
-         case NewAllWorkPids of
-            [] ->
-               ok;
-            _ ->
-               forMake([], _Worker, _NoExec, _Load, NewAllWorkPids)
-         end;
-      {mCompileError, Err} ->
-         errorStop(Err, AllWorkPids);
-      _Other ->
-         io:format("forMake [] receive unexpect msg:~p ~n", [_Other])
+forMake([], _Worker, _NoExec, _Load, IsAll, AllWorkPids) ->
+   case AllWorkPids of
+      [] ->
+         ok;
+      _ ->
+         receive
+            {mOverCompile, WPid} ->
+               NewAllWorkPids = lists:delete(WPid, AllWorkPids),
+               case NewAllWorkPids of
+                  [] ->
+                     ok;
+                  _ ->
+                     forMake([], _Worker, _NoExec, _Load, IsAll, NewAllWorkPids)
+               end;
+            {mCompileError, Err} ->
+               errorStop(Err, AllWorkPids);
+            _Other ->
+               io:format("forMake [] receive unexpect msg:~p ~n", [_Other])
+         end
    end;
-forMake([{Mods, Opts} | Rest], Worker, NoExec, Load, AllWorkPids) ->
+forMake([{Mods, Opts} | Rest], Worker, NoExec, Load, IsAll, AllWorkPids) ->
    case Mods of
       [] ->
-         forMake(Rest, Worker, NoExec, Load, AllWorkPids);
+         forMake(Rest, Worker, NoExec, Load, IsAll, AllWorkPids);
       _ ->
          case Worker > 0 of
             true ->
                {Files, More} = splitMods(Mods),
-               WPid = spawn_link(?MODULE, compileWorker, [Files, Opts, self(), NoExec, Load]),
+               WPid = spawn_link(?MODULE, compileWorker, [Files, Opts, self(), NoExec, Load, IsAll]),
                case More of
                   over ->
-                     forMake(Rest, Worker - 1, NoExec, Load, [WPid | AllWorkPids]);
+                     forMake(Rest, Worker - 1, NoExec, Load, IsAll, [WPid | AllWorkPids]);
                   _ ->
-                     forMake([{More, Opts} | Rest], Worker - 1, NoExec, Load, [WPid | AllWorkPids])
+                     forMake([{More, Opts} | Rest], Worker - 1, NoExec, Load, IsAll, [WPid | AllWorkPids])
                end;
             _ ->
                receive
@@ -230,9 +228,9 @@ forMake([{Mods, Opts} | Rest], Worker, NoExec, Load, AllWorkPids) ->
                      erlang:send(WPid, {mNewFile, Files, Opts}),
                      case More of
                         over ->
-                           forMake(Rest, Worker, NoExec, Load, AllWorkPids);
+                           forMake(Rest, Worker, NoExec, Load, IsAll, AllWorkPids);
                         _ ->
-                           forMake([{More, Opts} | Rest], Worker, NoExec, Load, AllWorkPids)
+                           forMake([{More, Opts} | Rest], Worker, NoExec, Load, IsAll, AllWorkPids)
                      end;
                   {mCompileError, Err} ->
                      errorStop(Err, AllWorkPids);
@@ -254,21 +252,21 @@ errorStop(Err, AllWorkPids) ->
    [exit(OnePid, kill) || OnePid <- AllWorkPids],
    case Err of
       {File, Errors, Warnings} ->
-         io:format("the file:~ts compile error:~p wrar:~p", [File, Errors, Warnings]);
+         io:format("the file:~ts compile error:~p wrar:~p ~n ", [File, Errors, Warnings]);
       File ->
-         io:format("the file:~ts compile error please check", [File])
+         io:format("the file:~ts compile error please check ~n ", [File])
    end.
 
-compileWorker([], _Opts, Parent, NoExec, Load) ->
+compileWorker([], _Opts, Parent, NoExec, Load, IsAll) ->
    erlang:send(Parent, {mOverCompile, self()}),
    receive
       {mNewFile, Files, Opts} ->
-         compileWorker(Files, Opts, Parent, NoExec, Load);
+         compileWorker(Files, Opts, Parent, NoExec, Load, IsAll);
       _Other ->
          io:format("compileWorker [] receive unexpect msg:~p ~n", [_Other])
    end;
-compileWorker([OneFile | Files], Opts, Parent, NoExec, Load) ->
-   case compile(coerce_2_list(OneFile), NoExec, Load, Opts) of
+compileWorker([OneFile | Files], Opts, Parent, NoExec, Load, IsAll) ->
+   case compile(coerce_2_list(OneFile), NoExec, Load, IsAll, Opts) of
       error ->
          Parent ! {mCompileError, OneFile},
          exit(error);
@@ -276,12 +274,12 @@ compileWorker([OneFile | Files], Opts, Parent, NoExec, Load) ->
          Parent ! {mCompileError, {OneFile, Errors, Warnings}},
          exit(error);
       _ ->
-         compileWorker(Files, Opts, Parent, NoExec, Load)
+         compileWorker(Files, Opts, Parent, NoExec, Load, IsAll)
    end.
 
-compile(File, NoExec, Load, Opts) ->
-   case get(compile_all) of
-      undefined ->
+compile(File, NoExec, Load, IsAll, Opts) ->
+   case IsAll of
+      false ->
          ObjName = lists:append(filename:basename(File), code:objfile_extension()),
          ObjFile =
             case lists:keysearch(outdir, 1, Opts) of
