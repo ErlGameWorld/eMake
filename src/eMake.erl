@@ -12,24 +12,26 @@
 ]).
 
 -define(MakeOpts, [noexec, load, netload, noload]).
+-define(EMakefile, "./Emakefile_dev").
+-define(OnceCnt, 16).
 
 main(Args) ->
    process_flag(trap_exit, true),
    case Args of
       [] ->
-         all(max(1, erlang:system_info(schedulers) - 1), "./Emakefile", []);
+         make(max(1, erlang:system_info(schedulers) - 1), ?EMakefile, []);
       [EMakeFileOrWorkCnt] ->
          try list_to_integer(EMakeFileOrWorkCnt) of
             Cnt ->
-               all(max(1, Cnt), "./Emakefile", [])
+               make(max(1, Cnt), ?EMakefile, [])
          catch _:_ ->
-            all(max(1, erlang:system_info(schedulers) - 1), EMakeFileOrWorkCnt, [])
+            make(max(1, erlang:system_info(schedulers) - 1), EMakeFileOrWorkCnt, [])
          end;
       [EMakeFile, WorkCntStr] ->
-         all(max(1, list_to_integer(WorkCntStr)), EMakeFile, []);
+         make(max(1, list_to_integer(WorkCntStr)), EMakeFile, []);
       [EMakeFile, WorkCntStr, OptsStr] ->
          {ok, Opts} = strToTerm(OptsStr),
-         all(max(1, list_to_integer(WorkCntStr)), EMakeFile, Opts)
+         make(max(1, list_to_integer(WorkCntStr)), EMakeFile, Opts)
    end.
 
 eMakeFile() ->
@@ -54,7 +56,7 @@ saveEMake(NowTime) ->
       ok
    end.
 
-all(WorkerCnt, EMakeFile, Opts) ->
+make(WorkerCnt, EMakeFile, Opts) ->
    io:format("compile start use EMakefile: ~ts~n", [EMakeFile]),
    StartTime = erlang:system_time(second),
    {MakeOpts, CompileOpts} = splitOpts(Opts, [], []),
@@ -62,10 +64,15 @@ all(WorkerCnt, EMakeFile, Opts) ->
       {ok, Files} ->
          LastTime = readEMake(),
          IsAll = LastTime /= 0 andalso StartTime =< LastTime,
-         forMake(Files, WorkerCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), IsAll, []),
+         Ret = forMake(Files, WorkerCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), IsAll, []),
          EndTime = erlang:system_time(second),
          saveEMake(EndTime),
-         io:format("compile over all is ok use time: ~ps ~n", [EndTime - StartTime]);
+         case Ret of
+            ok ->
+               io:format("compile over all is ok use time: ~ps ~n", [EndTime - StartTime]);
+            {error, _Err} ->
+               io:format("compile abort why: ~p~n", [_Err])
+         end;
       _Err ->
          _Err
    end.
@@ -132,7 +139,7 @@ transform([{Mod, ModOpts} | EMake], Opts, Files) ->
          transform(EMake, Opts, Files);
       Mods ->
          NewOpts = Opts ++ ModOpts,
-         ensure_dir(NewOpts),
+         ensureOutDir(NewOpts),
          transform(EMake, Opts, [{Mods, NewOpts} | Files])
    end;
 transform([Mod | EMake], Opts, Files) ->
@@ -140,11 +147,11 @@ transform([Mod | EMake], Opts, Files) ->
       [] ->
          transform(EMake, Opts, Files);
       Mods ->
-         ensure_dir(Opts),
+         ensureOutDir(Opts),
          transform(EMake, Opts, [{Mods, Opts} | Files])
    end.
 
-ensure_dir(Opts) ->
+ensureOutDir(Opts) ->
    case lists:keysearch(outdir, 1, Opts) of
       {value, {outdir, OutDir}} ->
          BeamDir = filename:join(OutDir, "xxx.beam"),
@@ -152,7 +159,6 @@ ensure_dir(Opts) ->
       _ ->
          ignore
    end.
-
 
 expand(Mod) when is_atom(Mod) ->
    expand(atom_to_list(Mod));
@@ -185,7 +191,6 @@ foldErl([OneFile | Left], Acc) ->
          foldErl(Left, Acc)
    end.
 
--define(OnceCnt, 8).
 forMake([], _Worker, _NoExec, _Load, IsAll, AllWorkPids) ->
    case AllWorkPids of
       [] ->
@@ -203,7 +208,8 @@ forMake([], _Worker, _NoExec, _Load, IsAll, AllWorkPids) ->
             {mCompileError, Err} ->
                errorStop(Err, AllWorkPids);
             _Other ->
-               io:format("forMake [] receive unexpect msg:~p ~n", [_Other])
+               io:format("forMake [] receive unexpect msg:~p ~n", [_Other]),
+               {error, _Other}
          end
    end;
 forMake([{Mods, Opts} | Rest], Worker, NoExec, Load, IsAll, AllWorkPids) ->
@@ -235,7 +241,8 @@ forMake([{Mods, Opts} | Rest], Worker, NoExec, Load, IsAll, AllWorkPids) ->
                   {mCompileError, Err} ->
                      errorStop(Err, AllWorkPids);
                   _Other ->
-                     io:format("forMake xx receive unexpect msg:~p ~n", [_Other])
+                     io:format("forMake xx receive unexpect msg:~p ~n", [_Other]),
+                     {error, _Other}
                end
          end
    end.
@@ -252,21 +259,25 @@ errorStop(Err, AllWorkPids) ->
    [exit(OnePid, kill) || OnePid <- AllWorkPids],
    case Err of
       {File, Errors, Warnings} ->
-         io:format("the file:~ts compile error:~p wrar:~p ~n ", [File, Errors, Warnings]);
+         io:format("the file:~ts compile error:~p wrar:~p ~n", [File, Errors, Warnings]);
       File ->
-         io:format("the file:~ts compile error please check ~n ", [File])
-   end.
+         io:format("the file:~ts compile error please check ~n", [File])
+   end,
+   {error, compile_error}.
 
-compileWorker([], _Opts, Parent, NoExec, Load, IsAll) ->
+compileWorker(Files, Opts, Parent, NoExec, Load, IsAll) ->
+   compileWork(Files, Opts, Parent, NoExec, Load, IsAll).
+
+compileWork([], _Opts, Parent, NoExec, Load, IsAll) ->
    erlang:send(Parent, {mOverCompile, self()}),
    receive
       {mNewFile, Files, Opts} ->
-         compileWorker(Files, Opts, Parent, NoExec, Load, IsAll);
+         compileWork(Files, Opts, Parent, NoExec, Load, IsAll);
       _Other ->
          io:format("compileWorker [] receive unexpect msg:~p ~n", [_Other])
    end;
-compileWorker([OneFile | Files], Opts, Parent, NoExec, Load, IsAll) ->
-   case compile(coerce_2_list(OneFile), NoExec, Load, IsAll, Opts) of
+compileWork([OneFile | Files], Opts, Parent, NoExec, Load, IsAll) ->
+   case tryCompile(coerce_2_list(OneFile), NoExec, Load, IsAll, Opts) of
       error ->
          Parent ! {mCompileError, OneFile},
          exit(error);
@@ -274,10 +285,10 @@ compileWorker([OneFile | Files], Opts, Parent, NoExec, Load, IsAll) ->
          Parent ! {mCompileError, {OneFile, Errors, Warnings}},
          exit(error);
       _ ->
-         compileWorker(Files, Opts, Parent, NoExec, Load, IsAll)
+         compileWork(Files, Opts, Parent, NoExec, Load, IsAll)
    end.
 
-compile(File, NoExec, Load, IsAll, Opts) ->
+tryCompile(File, NoExec, Load, IsAll, Opts) ->
    case IsAll of
       false ->
          ObjName = lists:append(filename:basename(File), code:objfile_extension()),
@@ -292,10 +303,10 @@ compile(File, NoExec, Load, IsAll, Opts) ->
             true ->
                reCompile(File, NoExec, Load, Opts, ObjFile);
             false ->
-               recompile(File, NoExec, Load, Opts)
+               doCompile(File, NoExec, Load, Opts)
          end;
       _ ->
-         recompile(File, NoExec, Load, Opts)
+         doCompile(File, NoExec, Load, Opts)
    end.
 
 reCompile(File, NoExec, Load, Opts, ObjFile) ->
@@ -303,7 +314,7 @@ reCompile(File, NoExec, Load, Opts, ObjFile) ->
    {ok, #file_info{mtime = ObjTime}} = file:read_file_info(ObjFile),
    case SrcTime > ObjTime of
       true ->
-         recompile(File, NoExec, Load, Opts);
+         doCompile(File, NoExec, Load, Opts);
       _ ->
          ckIncludeRecompile(ObjTime, File, NoExec, Load, Opts)
    end.
@@ -314,7 +325,7 @@ ckIncludeRecompile(ObjMTime, File, NoExec, Load, Opts) ->
    IncludePath = include_opt(Opts),
    case check_includes(lists:append(File, ".erl"), IncludePath, ObjMTime) of
       true ->
-         recompile(File, NoExec, Load, Opts);
+         doCompile(File, NoExec, Load, Opts);
       false ->
          false
    end.
@@ -330,15 +341,15 @@ include_opt([]) ->
 %% Actually recompile and load the file, depending on the flags.
 %% Where load can be netload | load | noload
 
-recompile(File, true, _Load, _Opts) ->
+doCompile(File, true, _Load, _Opts) ->
    io:format("Out of date: ~ts\n", [File]);
-recompile(File, false, noload, Opts) ->
+doCompile(File, false, noload, Opts) ->
    % io:format("Recompile: ~ts\n", [File]),
    compile:file(File, [report_errors, report_warnings, error_summary | Opts]);
-recompile(File, false, load, Opts) ->
+doCompile(File, false, load, Opts) ->
    % io:format("Recompile: ~ts\n", [File]),
    c:c(File, Opts);
-recompile(File, false, netload, Opts) ->
+doCompile(File, false, netload, Opts) ->
    % io:format("Recompile: ~ts\n", [File]),
    c:nc(File, Opts).
 
