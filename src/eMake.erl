@@ -12,32 +12,34 @@
 ]).
 
 -define(MakeOpts, [noexec, load, netload, noload]).
--define(EMakefile, "./Emakefile_dev").
+-define(EMakefile, "./Emakefile").
 -define(OnceCnt, 16).
 
 main(Args) ->
    process_flag(trap_exit, true),
-   case Args of
+   IsAll = lists:member("all", Args),
+   case lists:delete("all", Args) of
       [] ->
-         make(max(1, erlang:system_info(schedulers) - 1), ?EMakefile, []);
+         make(max(1, erlang:system_info(schedulers) - 1), ?EMakefile, [], IsAll);
       [EMakeFileOrWorkCnt] ->
          try list_to_integer(EMakeFileOrWorkCnt) of
             Cnt ->
-               make(max(1, Cnt), ?EMakefile, [])
+               make(max(1, Cnt), ?EMakefile, [], IsAll)
          catch _:_ ->
-            make(max(1, erlang:system_info(schedulers) - 1), EMakeFileOrWorkCnt, [])
+            make(max(1, erlang:system_info(schedulers) - 1), EMakeFileOrWorkCnt, [], IsAll)
          end;
       [EMakeFile, WorkCntStr] ->
-         make(max(1, list_to_integer(WorkCntStr)), EMakeFile, []);
+         make(max(1, list_to_integer(WorkCntStr)), EMakeFile, [], IsAll);
       [EMakeFile, WorkCntStr, OptsStr] ->
          {ok, Opts} = strToTerm(OptsStr),
-         make(max(1, list_to_integer(WorkCntStr)), EMakeFile, Opts)
+         make(max(1, list_to_integer(WorkCntStr)), EMakeFile, Opts, IsAll)
    end.
 
 eMakeFile() ->
    {ok, CurDir} = file:get_cwd(),
    Md5 = erlang:md5(CurDir),
-   filename:join(code:root_dir(), <<".eMake/", (base64:encode(Md5))/binary>>).
+   {ok, [[HomeDir]]} = init:get_argument(home),
+   filename:join(HomeDir, <<".eMake/", (base64:encode(Md5))/binary>>).
 
 readEMake() ->
    try {ok, [LastTime]} = file:consult(eMakeFile()), LastTime of
@@ -56,15 +58,15 @@ saveEMake(NowTime) ->
       ok
    end.
 
-make(WorkerCnt, EMakeFile, Opts) ->
+make(WorkerCnt, EMakeFile, Opts, IsAll) ->
    io:format("compile start use EMakefile: ~ts~n", [EMakeFile]),
    StartTime = erlang:system_time(second),
    {MakeOpts, CompileOpts} = splitOpts(Opts, [], []),
    case readEMakefile(EMakeFile, CompileOpts) of
       {ok, Files} ->
          LastTime = readEMake(),
-         IsAll = LastTime /= 0 andalso StartTime =< LastTime,
-         Ret = forMake(Files, WorkerCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), IsAll, []),
+         LIsAll = IsAll orelse (LastTime /= 0 andalso StartTime =< LastTime),
+         Ret = forMake(Files, WorkerCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), LIsAll, []),
          EndTime = erlang:system_time(second),
          saveEMake(EndTime),
          case Ret of
