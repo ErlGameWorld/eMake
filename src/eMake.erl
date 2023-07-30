@@ -6,7 +6,7 @@
 ]).
 
 -export([
-   compileWorker/6
+   compileWorker/7
    , readEMake/0
    , saveEMake/1
 ]).
@@ -17,22 +17,36 @@
 
 main(Args) ->
    process_flag(trap_exit, true),
-   IsAll = lists:member("all", Args),
-   case lists:delete("all", Args) of
-      [] ->
-         make(max(1, erlang:system_info(schedulers) - 1), ?EMakefile, [], IsAll);
-      [EMakeFileOrWorkCnt] ->
-         try list_to_integer(EMakeFileOrWorkCnt) of
-            Cnt ->
-               make(max(1, Cnt), ?EMakefile, [], IsAll)
-         catch _:_ ->
-            make(max(1, erlang:system_info(schedulers) - 1), EMakeFileOrWorkCnt, [], IsAll)
-         end;
-      [EMakeFile, WorkCntStr] ->
-         make(max(1, list_to_integer(WorkCntStr)), EMakeFile, [], IsAll);
-      [EMakeFile, WorkCntStr, OptsStr] ->
-         {ok, Opts} = strToTerm(OptsStr),
-         make(max(1, list_to_integer(WorkCntStr)), EMakeFile, Opts, IsAll)
+   case Args of
+      ["fo"] ->
+         os:cmd("redis-cli FLUSHDB"),
+         ok;
+      ["fo", DBNumStr | _] ->
+         os:cmd("redis-cli -n " ++ DBNumStr ++ " FLUSHDB"),
+         ok;
+      ["fa" | _] ->
+         os:cmd("redis-cli FLUSHALL"),
+         ok;
+      _ ->
+         IsAll = lists:member("all", Args),
+         IsNoHrl = lists:member("nohrl", Args),
+
+         case lists:delete("all", lists:delete("nohrl", Args)) of
+            [] ->
+               make(max(1, erlang:system_info(schedulers) - 1), ?EMakefile, [], IsAll, IsNoHrl);
+            [EMakeFileOrWorkCnt] ->
+               try list_to_integer(EMakeFileOrWorkCnt) of
+                  Cnt ->
+                     make(max(1, Cnt), ?EMakefile, [], IsAll, IsNoHrl)
+               catch _:_ ->
+                  make(max(1, erlang:system_info(schedulers) - 1), EMakeFileOrWorkCnt, [], IsAll, IsNoHrl)
+               end;
+            [EMakeFile, WorkCntStr] ->
+               make(max(1, list_to_integer(WorkCntStr)), EMakeFile, [], IsAll, IsNoHrl);
+            [EMakeFile, WorkCntStr, OptsStr] ->
+               {ok, Opts} = strToTerm(OptsStr),
+               make(max(1, list_to_integer(WorkCntStr)), EMakeFile, Opts, IsAll, IsNoHrl)
+         end
    end.
 
 eMakeFile() ->
@@ -58,7 +72,7 @@ saveEMake(NowTime) ->
       ok
    end.
 
-make(WorkerCnt, EMakeFile, Opts, IsAll) ->
+make(WorkerCnt, EMakeFile, Opts, IsAll, IsNoHrl) ->
    io:format("compile start use EMakefile: ~ts~n", [EMakeFile]),
    StartTime = erlang:system_time(second),
    {MakeOpts, CompileOpts} = splitOpts(Opts, [], []),
@@ -66,7 +80,7 @@ make(WorkerCnt, EMakeFile, Opts, IsAll) ->
       {ok, Files} ->
          LastTime = readEMake(),
          LIsAll = IsAll orelse (LastTime /= 0 andalso StartTime =< LastTime),
-         Ret = forMake(Files, WorkerCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), LIsAll, []),
+         Ret = forMake(Files, WorkerCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), LIsAll, IsNoHrl, []),
          EndTime = erlang:system_time(second),
          saveEMake(EndTime),
          case Ret of
@@ -193,7 +207,7 @@ foldErl([OneFile | Left], Acc) ->
          foldErl(Left, Acc)
    end.
 
-forMake([], _Worker, _NoExec, _Load, IsAll, AllWorkPids) ->
+forMake([], _Worker, _NoExec, _Load, IsAll, IsNoHrl, AllWorkPids) ->
    case AllWorkPids of
       [] ->
          ok;
@@ -205,7 +219,7 @@ forMake([], _Worker, _NoExec, _Load, IsAll, AllWorkPids) ->
                   [] ->
                      ok;
                   _ ->
-                     forMake([], _Worker, _NoExec, _Load, IsAll, NewAllWorkPids)
+                     forMake([], _Worker, _NoExec, _Load, IsAll, IsNoHrl, NewAllWorkPids)
                end;
             {mCompileError, Err} ->
                errorStop(Err, AllWorkPids);
@@ -214,20 +228,20 @@ forMake([], _Worker, _NoExec, _Load, IsAll, AllWorkPids) ->
                {error, _Other}
          end
    end;
-forMake([{Mods, Opts} | Rest], Worker, NoExec, Load, IsAll, AllWorkPids) ->
+forMake([{Mods, Opts} | Rest], Worker, NoExec, Load, IsAll, IsNoHrl, AllWorkPids) ->
    case Mods of
       [] ->
-         forMake(Rest, Worker, NoExec, Load, IsAll, AllWorkPids);
+         forMake(Rest, Worker, NoExec, Load, IsAll, IsNoHrl, AllWorkPids);
       _ ->
          case Worker > 0 of
             true ->
                {Files, More} = splitMods(Mods),
-               WPid = spawn_link(?MODULE, compileWorker, [Files, Opts, self(), NoExec, Load, IsAll]),
+               WPid = spawn_link(?MODULE, compileWorker, [Files, Opts, self(), NoExec, Load, IsAll, IsNoHrl]),
                case More of
                   over ->
-                     forMake(Rest, Worker - 1, NoExec, Load, IsAll, [WPid | AllWorkPids]);
+                     forMake(Rest, Worker - 1, NoExec, Load, IsAll, IsNoHrl, [WPid | AllWorkPids]);
                   _ ->
-                     forMake([{More, Opts} | Rest], Worker - 1, NoExec, Load, IsAll, [WPid | AllWorkPids])
+                     forMake([{More, Opts} | Rest], Worker - 1, NoExec, Load, IsAll, IsNoHrl, [WPid | AllWorkPids])
                end;
             _ ->
                receive
@@ -236,9 +250,9 @@ forMake([{Mods, Opts} | Rest], Worker, NoExec, Load, IsAll, AllWorkPids) ->
                      erlang:send(WPid, {mNewFile, Files, Opts}),
                      case More of
                         over ->
-                           forMake(Rest, Worker, NoExec, Load, IsAll, AllWorkPids);
+                           forMake(Rest, Worker, NoExec, Load, IsAll, IsNoHrl, AllWorkPids);
                         _ ->
-                           forMake([{More, Opts} | Rest], Worker, NoExec, Load, IsAll, AllWorkPids)
+                           forMake([{More, Opts} | Rest], Worker, NoExec, Load, IsAll, IsNoHrl, AllWorkPids)
                      end;
                   {mCompileError, Err} ->
                      errorStop(Err, AllWorkPids);
@@ -267,19 +281,19 @@ errorStop(Err, AllWorkPids) ->
    end,
    {error, compile_error}.
 
-compileWorker(Files, Opts, Parent, NoExec, Load, IsAll) ->
-   compileWork(Files, Opts, Parent, NoExec, Load, IsAll).
+compileWorker(Files, Opts, Parent, NoExec, Load, IsAll, IsNoHrl) ->
+   compileWork(Files, Opts, Parent, NoExec, Load, IsAll, IsNoHrl).
 
-compileWork([], _Opts, Parent, NoExec, Load, IsAll) ->
+compileWork([], _Opts, Parent, NoExec, Load, IsAll, IsNoHrl) ->
    erlang:send(Parent, {mOverCompile, self()}),
    receive
       {mNewFile, Files, Opts} ->
-         compileWork(Files, Opts, Parent, NoExec, Load, IsAll);
+         compileWork(Files, Opts, Parent, NoExec, Load, IsAll, IsNoHrl);
       _Other ->
          io:format("compileWorker [] receive unexpect msg:~p ~n", [_Other])
    end;
-compileWork([OneFile | Files], Opts, Parent, NoExec, Load, IsAll) ->
-   case tryCompile(coerce_2_list(OneFile), NoExec, Load, IsAll, Opts) of
+compileWork([OneFile | Files], Opts, Parent, NoExec, Load, IsAll, IsNoHrl) ->
+   case tryCompile(coerce_2_list(OneFile), NoExec, Load, IsAll, IsNoHrl, Opts) of
       error ->
          Parent ! {mCompileError, OneFile},
          exit(error);
@@ -287,10 +301,10 @@ compileWork([OneFile | Files], Opts, Parent, NoExec, Load, IsAll) ->
          Parent ! {mCompileError, {OneFile, Errors, Warnings}},
          exit(error);
       _ ->
-         compileWork(Files, Opts, Parent, NoExec, Load, IsAll)
+         compileWork(Files, Opts, Parent, NoExec, Load, IsAll, IsNoHrl)
    end.
 
-tryCompile(File, NoExec, Load, IsAll, Opts) ->
+tryCompile(File, NoExec, Load, IsAll, IsNoHrl, Opts) ->
    case IsAll of
       false ->
          ObjName = lists:append(filename:basename(File), code:objfile_extension()),
@@ -303,7 +317,7 @@ tryCompile(File, NoExec, Load, IsAll, Opts) ->
             end,
          case exists(ObjFile) of
             true ->
-               reCompile(File, NoExec, Load, Opts, ObjFile);
+               reCompile(File, NoExec, Load, Opts, ObjFile, IsNoHrl);
             false ->
                doCompile(File, NoExec, Load, Opts)
          end;
@@ -311,14 +325,14 @@ tryCompile(File, NoExec, Load, IsAll, Opts) ->
          doCompile(File, NoExec, Load, Opts)
    end.
 
-reCompile(File, NoExec, Load, Opts, ObjFile) ->
+reCompile(File, NoExec, Load, Opts, ObjFile, IsNoHrl) ->
    {ok, #file_info{mtime = SrcTime}} = file:read_file_info(lists:append(File, ".erl")),
    {ok, #file_info{mtime = ObjTime}} = file:read_file_info(ObjFile),
    case SrcTime > ObjTime of
       true ->
          doCompile(File, NoExec, Load, Opts);
       _ ->
-         ckIncludeRecompile(ObjTime, File, NoExec, Load, Opts)
+         IsNoHrl /= true andalso ckIncludeRecompile(ObjTime, File, NoExec, Load, Opts)
    end.
 
 %% recompile2(ObjMTime, File, NoExec, Load, Opts)
