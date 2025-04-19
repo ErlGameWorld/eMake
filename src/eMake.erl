@@ -6,7 +6,7 @@
 ]).
 
 -export([
-	compileWorker/7
+	compileWorker/8
 	, readEMake/0
 	, saveEMake/1
 ]).
@@ -16,37 +16,66 @@
 -define(OnceCnt, 16).
 
 main(Args) ->
+	MapArgs = parseArgs(Args),
 	process_flag(trap_exit, true),
-	case Args of
-		["fo"] ->
+	case MapArgs of
+		#{"fo" := true} ->
 			os:cmd("redis-cli FLUSHDB"),
 			ok;
-		["fo", DBNumStr | _] ->
+		#{"fo" := DBNumStr} ->
 			os:cmd("redis-cli -n " ++ DBNumStr ++ " FLUSHDB"),
 			ok;
-		["fa" | _] ->
+		#{"fa" := true} ->
 			os:cmd("redis-cli FLUSHALL"),
 			ok;
 		_ ->
-			IsAll = lists:member("all", Args),
-			IsNoHrl = lists:member("nohrl", Args),
-			
-			case lists:delete("all", lists:delete("nohrl", Args)) of
+			IsAll = maps:is_key("all", MapArgs),
+			IsPrint = maps:is_key("print", MapArgs),
+			IsNoHrl = maps:is_key("nohrl", MapArgs),
+			EMakeFile = maps:get("emakefile", MapArgs, ?EMakefile),
+			WorkCnt = maps:get("workcnt", MapArgs, erlang:system_info(schedulers) - 1),
+			OnceCnt = maps:get("oncecnt", MapArgs, ?OnceCnt),
+			OptsStr = maps:get("opts", MapArgs, "[]"),
+			{ok, Opts} = strToTerm(OptsStr),
+			make(max(1, WorkCnt), max(1, OnceCnt), EMakeFile, Opts, IsAll, IsNoHrl, IsPrint)
+	end.
+
+%% 解析命令行参数成map
+parseArgs(Args) ->
+	parseArgs(Args, #{}).
+parseArgs([], Ret) -> Ret;
+parseArgs([Flag | Rest], Ret) ->
+	case Flag of
+		[$-, $n | Left] ->
+			case Rest of
 				[] ->
-					make(max(1, erlang:system_info(schedulers) - 1), ?EMakefile, [], IsAll, IsNoHrl);
-				[EMakeFileOrWorkCnt] ->
-					try list_to_integer(EMakeFileOrWorkCnt) of
-						Cnt ->
-							make(max(1, Cnt), ?EMakefile, [], IsAll, IsNoHrl)
-					catch _:_ ->
-						make(max(1, erlang:system_info(schedulers) - 1), EMakeFileOrWorkCnt, [], IsAll, IsNoHrl)
-					end;
-				[EMakeFile, WorkCntStr] ->
-					make(max(1, list_to_integer(WorkCntStr)), EMakeFile, [], IsAll, IsNoHrl);
-				[EMakeFile, WorkCntStr, OptsStr] ->
-					{ok, Opts} = strToTerm(OptsStr),
-					make(max(1, list_to_integer(WorkCntStr)), EMakeFile, Opts, IsAll, IsNoHrl)
-			end
+					parseArgs(Rest, Ret#{Left => true});
+				_ ->
+					[Value | LRest] = Rest,
+					case Value of
+						[$- | _] ->
+							parseArgs(Rest, Ret#{Left => true});
+						_ ->
+							parseArgs(LRest, Ret#{LRest => Value})
+					end
+			end;
+		[$-, $s | Left] ->
+			[Value | LRest] = Rest,
+			parseArgs(LRest, Ret#{Left => Value});
+		[$-, $i | Left] ->
+			[Value | LRest] = Rest,
+			parseArgs(LRest, Ret#{Left => list_to_integer(Value)});
+		[$-, $a | Left] ->
+			[Value | LRest] = Rest,
+			parseArgs(LRest, Ret#{Left => list_to_atom(Value)});
+		[$-, $f | Left] ->
+			[Value | LRest] = Rest,
+			parseArgs(LRest, Ret#{Left => list_to_float(Value)});
+		[$-, $b | Left] ->
+			[Value | LRest] = Rest,
+			parseArgs(LRest, Ret#{Left => list_to_binary(Value)});
+		_ ->
+			parseArgs(Rest, Ret#{Flag => true})
 	end.
 
 eMakeFile() ->
@@ -72,15 +101,15 @@ saveEMake(NowTime) ->
 		ok
 	end.
 
-make(WorkerCnt, EMakeFile, Opts, IsAll, IsNoHrl) ->
-	io:format("compile start use EMakefile: ~ts~n", [EMakeFile]),
+make(WorkerCnt, OnceCnt, EMakeFile, Opts, IsAll, IsNoHrl, IsPrint) ->
+	io:format("compile start use EMakefile: ~ts ~n", [EMakeFile]),
 	StartTime = erlang:system_time(second),
 	{MakeOpts, CompileOpts} = splitOpts(Opts, [], []),
 	LastTime = readEMake(),
 	LIsAll = IsAll orelse (LastTime /= 0 andalso StartTime =< LastTime),
 	case readEMakefile(EMakeFile, CompileOpts, LIsAll) of
 		{ok, Files} ->
-			Ret = forMake(Files, WorkerCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), LIsAll, IsNoHrl, []),
+			Ret = forMake(Files, WorkerCnt, OnceCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), LIsAll, IsNoHrl, IsPrint, []),
 			EndTime = erlang:system_time(second),
 			saveEMake(EndTime),
 			case Ret of
@@ -208,7 +237,7 @@ foldErl([OneFile | Left], Acc) ->
 			foldErl(Left, Acc)
 	end.
 
-forMake([], _Worker, _NoExec, _Load, IsAll, IsNoHrl, AllWorkPids) ->
+forMake([], _WorkerCnt, _OnceCnt, _NoExec, _Load, IsAll, IsNoHrl, IsPrint, AllWorkPids) ->
 	case AllWorkPids of
 		[] ->
 			ok;
@@ -220,7 +249,7 @@ forMake([], _Worker, _NoExec, _Load, IsAll, IsNoHrl, AllWorkPids) ->
 						[] ->
 							ok;
 						_ ->
-							forMake([], _Worker, _NoExec, _Load, IsAll, IsNoHrl, NewAllWorkPids)
+							forMake([], _WorkerCnt, _OnceCnt, _NoExec, _Load, IsAll, IsNoHrl, IsPrint, NewAllWorkPids)
 					end;
 				{mCompileError, Err} ->
 					errorStop(Err, AllWorkPids);
@@ -229,31 +258,31 @@ forMake([], _Worker, _NoExec, _Load, IsAll, IsNoHrl, AllWorkPids) ->
 					{error, _Other}
 			end
 	end;
-forMake([{Mods, Opts} | Rest], Worker, NoExec, Load, IsAll, IsNoHrl, AllWorkPids) ->
+forMake([{Mods, Opts} | Rest], WorkerCnt, OnceCnt, NoExec, Load, IsAll, IsNoHrl, IsPrint, AllWorkPids) ->
 	case Mods of
 		[] ->
-			forMake(Rest, Worker, NoExec, Load, IsAll, IsNoHrl, AllWorkPids);
+			forMake(Rest, WorkerCnt, OnceCnt, NoExec, Load, IsAll, IsNoHrl, IsPrint, AllWorkPids);
 		_ ->
-			case Worker > 0 of
+			case WorkerCnt > 0 of
 				true ->
-					{Files, More} = splitMods(Mods),
-					WPid = spawn_link(?MODULE, compileWorker, [Files, Opts, self(), NoExec, Load, IsAll, IsNoHrl]),
+					{Files, More} = splitMods(Mods, OnceCnt),
+					WPid = spawn_link(?MODULE, compileWorker, [Files, Opts, self(), NoExec, Load, IsAll, IsNoHrl, IsPrint]),
 					case More of
 						over ->
-							forMake(Rest, Worker - 1, NoExec, Load, IsAll, IsNoHrl, [WPid | AllWorkPids]);
+							forMake(Rest, WorkerCnt - 1, OnceCnt, NoExec, Load, IsAll, IsNoHrl, IsPrint, [WPid | AllWorkPids]);
 						_ ->
-							forMake([{More, Opts} | Rest], Worker - 1, NoExec, Load, IsAll, IsNoHrl, [WPid | AllWorkPids])
+							forMake([{More, Opts} | Rest], WorkerCnt - 1, OnceCnt, NoExec, Load, IsAll, IsNoHrl, IsPrint, [WPid | AllWorkPids])
 					end;
 				_ ->
 					receive
 						{mOverCompile, WPid} ->
-							{Files, More} = splitMods(Mods),
+							{Files, More} = splitMods(Mods, OnceCnt),
 							erlang:send(WPid, {mNewFile, Files, Opts}),
 							case More of
 								over ->
-									forMake(Rest, Worker, NoExec, Load, IsAll, IsNoHrl, AllWorkPids);
+									forMake(Rest, WorkerCnt, OnceCnt, NoExec, Load, IsAll, IsNoHrl, IsPrint, AllWorkPids);
 								_ ->
-									forMake([{More, Opts} | Rest], Worker, NoExec, Load, IsAll, IsNoHrl, AllWorkPids)
+									forMake([{More, Opts} | Rest], WorkerCnt, OnceCnt, NoExec, Load, IsAll, IsNoHrl, IsPrint, AllWorkPids)
 							end;
 						{mCompileError, Err} ->
 							errorStop(Err, AllWorkPids);
@@ -264,9 +293,9 @@ forMake([{Mods, Opts} | Rest], Worker, NoExec, Load, IsAll, IsNoHrl, AllWorkPids
 			end
 	end.
 
-splitMods(Mods) ->
-	{CurList, Index, LeftList} = splitFiles(?OnceCnt, Mods, 0, []),
-	case Index < ?OnceCnt of
+splitMods(Mods, OnceCnt) ->
+	{CurList, Index, LeftList} = splitFiles(OnceCnt, Mods, 0, []),
+	case Index < OnceCnt of
 		true ->
 			{TCurList, _TIndex, TLeftList} = splitFiles(1, Mods, 0, []),
 			case TLeftList of
@@ -296,7 +325,8 @@ errorStop(Err, AllWorkPids) ->
 	end,
 	{error, compile_error}.
 
-compileWorker(Files, Opts, Parent, NoExec, Load, IsAll, IsNoHrl) ->
+compileWorker(Files, Opts, Parent, NoExec, Load, IsAll, IsNoHrl, IsPrint) ->
+	put(isPrint, IsPrint),
 	compileWork(Files, Opts, Parent, NoExec, Load, IsAll, IsNoHrl).
 
 compileWork([], _Opts, Parent, NoExec, Load, IsAll, IsNoHrl) ->
@@ -375,14 +405,20 @@ include_opt([]) ->
 doCompile(File, true, _Load, _Opts) ->
 	io:format("Out of date: ~ts\n", [File]);
 doCompile(File, false, noload, Opts) ->
-	% io:format("Recompile: ~ts\n", [File]),
-	compile:file(File, [report_errors, report_warnings, error_summary | Opts]);
+	StartTime = erlang:system_time(millisecond),
+	CRet = compile:file(File, [report_errors, report_warnings, error_summary | Opts]),
+	get(isPrint) andalso io:format("Recompile: ~ts use time:~pms\n", [File, erlang:system_time(millisecond) - StartTime]),
+	CRet;
 doCompile(File, false, load, Opts) ->
-	% io:format("Recompile: ~ts\n", [File]),
-	c:c(File, Opts);
+	StartTime = erlang:system_time(millisecond),
+	CRet = c:c(File, Opts),
+	get(isPrint) andalso io:format("Recompile: ~ts use time:~pms\n", [File, erlang:system_time(millisecond) - StartTime]),
+	CRet;
 doCompile(File, false, netload, Opts) ->
-	% io:format("Recompile: ~ts\n", [File]),
-	c:nc(File, Opts).
+	StartTime = erlang:system_time(millisecond),
+	CRet = c:nc(File, Opts),
+	get(isPrint) andalso io:format("Recompile: ~ts use time:~pms\n", [File, erlang:system_time(millisecond) - StartTime]),
+	CRet.
 
 exists(File) ->
 	case file:read_file_info(File) of
