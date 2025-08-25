@@ -15,6 +15,19 @@
 -define(EMakefile, "./Emakefile").
 -define(OnceCnt, 16).
 
+-define(help(), <<"
+-nfo            清理redis
+-sfo Num        清理redis
+-nfa            清理redis
+-nall           编译所有
+-nprint         打印编译信息
+-nnohrl         增量编译不检查头文件
+-semakefile Makefile   指定编译的Makefile文件
+-iworkcnt Num   编译进程最大数量
+-ioncecnt Num   单次批量编编译的文件数
+-sopts String   编译选项字符串
+-h              帮助\n"/utf8>>).
+
 main(Args) ->
 	MapArgs = parseArgs(Args),
 	process_flag(trap_exit, true),
@@ -28,6 +41,8 @@ main(Args) ->
 		#{"fa" := true} ->
 			os:cmd("redis-cli FLUSHALL"),
 			ok;
+		#{"-h" := true} ->
+			io:format("~s", [?help()]);
 		_ ->
 			IsAll = maps:is_key("all", MapArgs),
 			IsPrint = maps:is_key("print", MapArgs),

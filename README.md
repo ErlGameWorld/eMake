@@ -36,3 +36,8 @@ eg
     eMake -nfa
     eMake -nall -nnohrl -semakefile "./Emakefile" -iworkcnt 4 -sopts "[noexec, debug_info]"
     可以在编译之后修改代码指定默认的 Emakefile文件
+    如果cmd下乱码 可以使用chcp 65001命令
+
+    @echo off
+    chcp 65001 > nul
+    escript.exe "%~dpn0" %*
