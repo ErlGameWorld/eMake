@@ -42,7 +42,7 @@ main(Args) ->
 			os:cmd("redis-cli FLUSHALL"),
 			ok;
 		#{"-h" := true} ->
-			io:format("~s", [?help()]);
+			io:format("~ts", [?help()]);
 		_ ->
 			IsAll = maps:is_key("all", MapArgs),
 			IsPrint = maps:is_key("print", MapArgs),
