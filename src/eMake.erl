@@ -8,11 +8,13 @@
 -export([
 	compileWorker/8
 	, readEMake/0
-	, saveEMake/1
+	, readEMake/2
+	, readEMake/3
+	, saveEMake/2
 ]).
 
 -define(MakeOpts, [noexec, load, netload, noload]).
--define(EMakefile, "./Emakefile").
+-define(EMakefile, "Emakefile").
 -define(OnceCnt, 16).
 
 -define(help(), <<"
@@ -20,12 +22,17 @@
 -sfo Num        清理redis
 -nfa            清理redis
 -nall           编译所有
--nprint         打印编译信息
+-nprint         打印编译文件与编译时长
+-sprint  opts|time   打印编译文件,编译时长与编译选项
 -nnohrl         增量编译不检查头文件
 -semakefile Makefile   指定编译的Makefile文件
 -iworkcnt Num   编译进程最大数量
 -ioncecnt Num   单次批量编编译的文件数
 -sopts String   编译选项字符串
+-ssopts String  设置本地编译选项字符串
+-ndopts         删除本地编译选项字符串
+-ngopts         获取编译选项字符串
+-sgopts DirString 获取编译选项字符串
 -h              帮助\n"/utf8>>).
 
 main(Args) ->
@@ -41,18 +48,32 @@ main(Args) ->
 		#{"fa" := true} ->
 			os:cmd("redis-cli FLUSHALL"),
 			ok;
+		#{"gopts" := true} ->
+			io:format("~s", [readEMake(localOpts, "[]")]),
+			ok;
+		#{"gopts" := DirString} ->
+			io:format("~s", [readEMake(DirString, localOpts, "[]")]),
+			ok;
+		#{"dopts" := true} ->
+			saveEMake(localOpts, "[]"),
+			ok;
+		#{"sopts" := OptsStr} ->
+			saveEMake(localOpts, OptsStr),
+			ok;
 		#{"-h" := true} ->
 			io:format("~ts", [?help()]);
 		_ ->
 			IsAll = maps:is_key("all", MapArgs),
-			IsPrint = maps:is_key("print", MapArgs),
+			IsPrint = maps:get("print", MapArgs, false),
 			IsNoHrl = maps:is_key("nohrl", MapArgs),
 			EMakeFile = maps:get("emakefile", MapArgs, ?EMakefile),
 			WorkCnt = maps:get("workcnt", MapArgs, erlang:system_info(schedulers) - 1),
 			OnceCnt = maps:get("oncecnt", MapArgs, ?OnceCnt),
 			OptsStr = maps:get("opts", MapArgs, "[]"),
 			{ok, Opts} = strToTerm(OptsStr),
-			make(max(1, WorkCnt), max(1, OnceCnt), EMakeFile, Opts, IsAll, IsNoHrl, IsPrint)
+			LocalOptsStr = readEMake(localOpts, "[]"),
+			{ok, LocalOpts} = strToTerm(LocalOptsStr),
+			make(max(1, WorkCnt), max(1, OnceCnt), EMakeFile, LocalOpts ++ Opts, IsAll, IsNoHrl, IsPrint)
 	end.
 
 %% 解析命令行参数成map
@@ -71,7 +92,7 @@ parseArgs([Flag | Rest], Ret) ->
 						[$- | _] ->
 							parseArgs(Rest, Ret#{Left => true});
 						_ ->
-							parseArgs(LRest, Ret#{LRest => Value})
+							parseArgs(LRest, Ret#{Left => Value})
 					end
 			end;
 		[$-, $s | Left] ->
@@ -93,25 +114,61 @@ parseArgs([Flag | Rest], Ret) ->
 			parseArgs(Rest, Ret#{Flag => true})
 	end.
 
+%% Base62 字符集 (0-9, A-Z, a-z)
+-define(BASE62_CHARS, {
+	48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
+	65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+	97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122
+}).
+
+%% 将整数编码为Base62字符串
+enBase62(0) -> <<"0">>;
+enBase62(N) -> enBase62(N, <<>>).
+enBase62(0, BBinAcc) -> BBinAcc;
+enBase62(N, BBinAcc) -> Index = (N rem 62) + 1, Char = element(Index, ?BASE62_CHARS), enBase62(N div 62, <<BBinAcc/binary, Char:8>>).
+md5ToBase62(Bin) -> enBase62(binary:decode_unsigned(Bin)).
+
 eMakeFile() ->
 	{ok, CurDir} = file:get_cwd(),
+	eMakeFile(CurDir).
+eMakeFile(CurDir) ->
 	Md5 = erlang:md5(CurDir),
 	{ok, [[HomeDir]]} = init:get_argument(home),
-	filename:join(HomeDir, <<".eMake/", (base64:encode(Md5))/binary>>).
+	Md5Base62 = md5ToBase62(Md5),
+	filename:join(HomeDir, <<".eMake/", Md5Base62/binary>>).
 
 readEMake() ->
-	try {ok, [LastTime]} = file:consult(eMakeFile()), LastTime of
+	try {ok, [MapValue]} = file:consult(eMakeFile()), MapValue of
 		Value ->
 			Value
 	catch _:_ ->
-		0
+		#{}
 	end.
 
-saveEMake(NowTime) ->
+readEMake(Key, DefValue) ->
+	try {ok, [MapValue]} = file:consult(eMakeFile()), maps:get(Key, MapValue, DefValue) of
+		Value ->
+			Value
+	catch _:_ ->
+		DefValue
+	end.
+
+readEMake(Dir, Key, DefValue) ->
+	try {ok, [MapValue]} = file:consult(eMakeFile(Dir)), maps:get(Key, MapValue, DefValue) of
+		Value ->
+			Value
+	catch _:_ ->
+		DefValue
+	end.
+
+saveEMake(Key, Value) ->
 	try
 		FileName = eMakeFile(),
 		filelib:ensure_dir(FileName),
-		file:write_file(FileName, <<(integer_to_binary(NowTime))/binary, ".">>)
+		MapValue = readEMake(),
+		NMapValue = MapValue#{Key => Value},
+		WriteStr = iolist_to_binary(io_lib:format("~0p", [NMapValue])),
+		file:write_file(FileName, <<WriteStr/binary, ".">>)
 	catch _:_ ->
 		ok
 	end.
@@ -120,13 +177,13 @@ make(WorkerCnt, OnceCnt, EMakeFile, Opts, IsAll, IsNoHrl, IsPrint) ->
 	io:format("compile start use EMakefile: ~ts ~n", [EMakeFile]),
 	StartTime = erlang:system_time(second),
 	{MakeOpts, CompileOpts} = splitOpts(Opts, [], []),
-	LastTime = readEMake(),
+	LastTime = readEMake(lastTime, 0),
 	LIsAll = IsAll orelse (LastTime /= 0 andalso StartTime =< LastTime),
 	case readEMakefile(EMakeFile, CompileOpts, LIsAll) of
 		{ok, Files} ->
 			Ret = forMake(Files, WorkerCnt, OnceCnt, lists:member(noexec, MakeOpts), load_opt(MakeOpts), LIsAll, IsNoHrl, IsPrint, []),
 			EndTime = erlang:system_time(second),
-			saveEMake(EndTime),
+			saveEMake(lastTime, EndTime),
 			case Ret of
 				ok ->
 					io:format("compile over all is ok use time: ~ps IsAll:~p ~n", [EndTime - StartTime, LIsAll]);
@@ -386,13 +443,21 @@ tryCompile(File, NoExec, Load, IsAll, IsNoHrl, Opts) ->
 	end.
 
 reCompile(File, NoExec, Load, Opts, ObjFile, IsNoHrl) ->
-	{ok, #file_info{mtime = SrcTime}} = file:read_file_info(lists:append(File, ".erl")),
-	{ok, #file_info{mtime = ObjTime}} = file:read_file_info(ObjFile),
-	case SrcTime > ObjTime of
-		true ->
-			doCompile(File, NoExec, Load, Opts);
-		_ ->
-			IsNoHrl /= true andalso ckIncludeRecompile(ObjTime, File, NoExec, Load, Opts)
+	case file:read_file_info(lists:append(File, ".erl")) of
+		{ok, #file_info{mtime = SrcTime}} ->
+			case file:read_file_info(ObjFile) of
+				{ok, #file_info{mtime = ObjTime}} ->
+					case SrcTime > ObjTime of
+						true ->
+							doCompile(File, NoExec, Load, Opts);
+						_ ->
+							IsNoHrl /= true andalso ckIncludeRecompile(ObjTime, File, NoExec, Load, Opts)
+					end;
+				{error, _} ->
+					doCompile(File, NoExec, Load, Opts)
+			end;
+		{error, _} ->
+			doCompile(File, NoExec, Load, Opts)
 	end.
 
 %% recompile2(ObjMTime, File, NoExec, Load, Opts)
@@ -422,18 +487,27 @@ doCompile(File, true, _Load, _Opts) ->
 doCompile(File, false, noload, Opts) ->
 	StartTime = erlang:system_time(millisecond),
 	CRet = compile:file(File, [report_errors, report_warnings, error_summary | Opts]),
-	get(isPrint) andalso io:format("Recompile: ~ts use time:~pms\n", [File, erlang:system_time(millisecond) - StartTime]),
+	doPrint(get(isPrint), File, StartTime, [report_errors, report_warnings, error_summary | Opts]),
 	CRet;
 doCompile(File, false, load, Opts) ->
 	StartTime = erlang:system_time(millisecond),
 	CRet = c:c(File, Opts),
-	get(isPrint) andalso io:format("Recompile: ~ts use time:~pms\n", [File, erlang:system_time(millisecond) - StartTime]),
+	doPrint(get(isPrint), File, StartTime, Opts),
 	CRet;
 doCompile(File, false, netload, Opts) ->
 	StartTime = erlang:system_time(millisecond),
 	CRet = c:nc(File, Opts),
-	get(isPrint) andalso io:format("Recompile: ~ts use time:~pms\n", [File, erlang:system_time(millisecond) - StartTime]),
+	doPrint(get(isPrint), File, StartTime, Opts),
 	CRet.
+
+doPrint(false, _File, _StartTime, _Opts) ->
+	ignore;
+doPrint(true, File, StartTime, _Opts) ->
+	io:format("Recompile: ~ts use time:~pms\n", [File, erlang:system_time(millisecond) - StartTime]);
+doPrint("time", File, StartTime, _Opts) ->
+	io:format("Recompile: ~ts use time:~pms\n", [File, erlang:system_time(millisecond) - StartTime]);
+doPrint(_, File, StartTime, Opts) ->
+	io:format("Recompile: ~ts use time:~pms opts:~0p\n", [File, erlang:system_time(millisecond) - StartTime, Opts]).
 
 exists(File) ->
 	case file:read_file_info(File) of
